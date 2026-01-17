@@ -1,0 +1,6 @@
+PyQt5>=5.15.0
+pygame>=2.0.0
+pynput>=1.7.0
+sounddevice>=0.4.0
+numpy>=1.20.0
+vosk>=0.3.45

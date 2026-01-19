@@ -33,9 +33,13 @@ a = Analysis(
     binaries=vosk_binaries,
     datas=[
         ('guanyu_song.mp3', '.'),
+        ('guanyu_song_1.mp3', '.'),
+        ('guanyu_song_2.mp3', '.'),
+        ('guanyu_song_3.mp3', '.'),
+        ('guanyu_song_4.mp3', '.'),
         ('guanyu_icon.ico', '.'),
-        # 语音模型（如果需要内置）
-        # ('vosk-model-small-cn-0.22', 'vosk-model-small-cn-0.22'),
+        # 语音模型（内置以便开箱即用）
+        ('vosk-model-small-cn-0.22', 'vosk-model-small-cn-0.22'),
     ] + vosk_datas,
     hiddenimports=[
         'vosk',

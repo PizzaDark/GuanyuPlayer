@@ -8,7 +8,8 @@ from pathlib import Path
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QSlider, QLabel, QComboBox, QCheckBox,
-    QGroupBox, QMessageBox, QSystemTrayIcon, QMenu, QAction, QFrame
+    QGroupBox, QMessageBox, QSystemTrayIcon, QMenu, QAction, QFrame,
+    QScrollArea
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt5.QtGui import QIcon, QFont
@@ -29,6 +30,19 @@ except ImportError:
 CONFIG_FILE = Path.home() / ".guanyu_song_config.json"
 # 使用列表保持顺序
 DEFAULT_HOTKEY = ['alt', 'g', 'y']
+# 默认关键词列表（最多10个）
+DEFAULT_KEYWORDS = ['释怀', '天意']
+# 默认模型路径
+DEFAULT_MODEL_PATH = 'vosk-model-small-cn-0.22'
+# 音乐预设
+PRESET_CLASSIC = {
+    'name': '经典模式',
+    'files': ['guanyu_song.mp3']
+}
+PRESET_GACHA = {
+    'name': '抽卡模式',
+    'files': ['guanyu_song_1.mp3', 'guanyu_song_2.mp3', 'guanyu_song_3.mp3', 'guanyu_song_4.mp3']
+}
 
 # 按键优先级排序（用于显示）
 KEY_PRIORITY = {
@@ -39,7 +53,7 @@ KEY_PRIORITY = {
 class SignalEmitter(QObject):
     """用于线程间通信的信号发射器"""
     trigger_play = pyqtSignal()
-    keyword_detected = pyqtSignal()
+    keyword_detected = pyqtSignal(str)  # 传递检测到的关键词
     hotkey_captured = pyqtSignal(list)  # 新增：快捷键捕获完成信号
 
 
@@ -233,10 +247,11 @@ class HotkeyCapture:
 
 class VoiceRecognizer:
     """语音识别器"""
-    def __init__(self, keyword, callback, device_index=None):
-        self.keyword = keyword
+    def __init__(self, keywords, callback, device_index=None, model_path=None):
+        self.keywords = keywords if isinstance(keywords, list) else [keywords]
         self.callback = callback
         self.device_index = device_index
+        self.user_model_path = model_path  # 用户指定的模型路径
         self.running = False
         self.thread = None
         self.model = None
@@ -245,18 +260,31 @@ class VoiceRecognizer:
     def load_model(self):
         """加载Vosk模型"""
         if not VOSK_AVAILABLE:
+            self.enabled = False
             return False
         try:
             model_path = self.find_model_path()
             if model_path and os.path.exists(model_path):
                 self.model = vosk.Model(model_path)
+                self.enabled = True
+                print(f"模型加载成功，语音识别已启用")
                 return True
         except Exception as e:
             print(f"模型加载失败: {e}")
+            self.enabled = False
         return False
     
     def find_model_path(self):
         """查找Vosk模型路径"""
+        # 优先使用用户指定的路径
+        if self.user_model_path:
+            if os.path.exists(self.user_model_path):
+                print(f"使用用户指定的语音模型: {self.user_model_path}")
+                return self.user_model_path
+            else:
+                print(f"警告: 用户指定的模型路径不存在: {self.user_model_path}")
+        
+        # 自动查找
         if getattr(sys, 'frozen', False):
             base_dir = sys._MEIPASS
         else:
@@ -285,6 +313,8 @@ class VoiceRecognizer:
                 print("无法加载语音模型，语音识别功能不可用")
                 self.enabled = False
                 return
+            else:
+                self.enabled = True
                 
         try:
             recognizer = vosk.KaldiRecognizer(self.model, 16000)
@@ -301,9 +331,12 @@ class VoiceRecognizer:
                     if recognizer.AcceptWaveform(bytes(data)):
                         result = json.loads(recognizer.Result())
                         text = result.get('text', '')
-                        if self.keyword in text:
-                            print(f"检测到关键词: {self.keyword}")
-                            self.callback()
+                        # 检查任何一个关键词
+                        for keyword in self.keywords:
+                            if keyword in text:
+                                print(f"检测到关键词: {keyword}")
+                                self.callback(keyword)
+                                break
         except Exception as e:
             print(f"语音识别错误: {e}")
             self.enabled = False
@@ -326,14 +359,31 @@ class VoiceRecognizer:
         if self.running:
             self.stop()
             self.start()
+    
+    def set_model_path(self, model_path):
+        """设置模型路径"""
+        self.user_model_path = model_path
+        self.model = None  # 清除当前模型
+        self.enabled = False  # 重置状态，等待重新加载
+        # 重启识别器以应用新模型
+        if self.running:
+            self.stop()
+            self.start()
 
 
 class AudioPlayer:
     """音频播放器"""
-    def __init__(self, audio_file):
-        self.audio_file = audio_file
+    def __init__(self, audio_files, base_path):
+        # 支持单个文件或文件列表
+        if isinstance(audio_files, str):
+            self.audio_files = [audio_files]
+        else:
+            self.audio_files = audio_files
+        self.base_path = base_path
+        self.current_file = None
         self.is_playing = False
         self.initialized = False
+        self.lock = threading.Lock()  # 添加线程锁
         self._init_mixer()
         
     def _init_mixer(self):
@@ -344,29 +394,64 @@ class AudioPlayer:
             print(f"音频初始化失败: {e}")
             self.initialized = False
         
-    def play(self):
+    def play(self, specific_file=None):
+        """播放音频，如果不指定文件则随机选择一个"""
         if not self.initialized:
             return
+        
+        # 使用线程锁保护，避免与语音识别冲突
+        acquired = self.lock.acquire(timeout=2.0)
+        if not acquired:
+            print("[警告] 无法获取音频锁，播放操作被跳过")
+            return
+        
         try:
-            if not os.path.exists(self.audio_file):
-                print(f"音频文件不存在: {self.audio_file}")
+            if specific_file:
+                # 播放指定文件
+                file_path = specific_file if os.path.isabs(specific_file) else os.path.join(self.base_path, specific_file)
+            else:
+                # 随机选择一个文件
+                import random
+                if not self.audio_files:
+                    print("没有可用的音频文件")
+                    return
+                selected_file = random.choice(self.audio_files)
+                # 判断是绝对路径还是相对路径
+                file_path = selected_file if os.path.isabs(selected_file) else os.path.join(self.base_path, selected_file)
+            
+            if not os.path.exists(file_path):
+                print(f"音频文件不存在: {file_path}")
                 return
-            mixer.music.load(self.audio_file)
+            
+            self.current_file = os.path.basename(file_path)
+            mixer.music.load(file_path)
             mixer.music.play()
             self.is_playing = True
+            print(f"正在播放: {self.current_file}")
         except Exception as e:
             print(f"播放错误: {e}")
+        finally:
+            self.lock.release()
             
     def stop(self):
         if not self.initialized:
             return
+        
+        acquired = self.lock.acquire(timeout=2.0)
+        if not acquired:
+            print("[警告] 无法获取音频锁，停止操作被跳过")
+            return
+        
         try:
             mixer.music.stop()
-        except Exception:
-            pass
-        self.is_playing = False
+            self.is_playing = False
+        except Exception as e:
+            print(f"停止播放错误: {e}")
+        finally:
+            self.lock.release()
         
     def toggle(self):
+        # stop和play方法内部已经有锁保护
         if self.is_playing:
             self.stop()
         else:
@@ -380,6 +465,27 @@ class AudioPlayer:
                 mixer.music.set_volume(volume)
             except Exception:
                 pass
+    
+    def update_files(self, audio_files):
+        """更新音频文件列表"""
+        if isinstance(audio_files, str):
+            self.audio_files = [audio_files]
+        else:
+            self.audio_files = audio_files
+    
+    def get_current_file(self):
+        """获取当前播放的文件名"""
+        return self.current_file
+    
+    def preview(self, filename):
+        """试听指定文件（异步执行）"""
+        def _preview():
+            self.stop()
+            time.sleep(0.1)  # 短暂延迟确保停止完成
+            self.play(specific_file=filename)
+        
+        # 在新线程中执行，避免阻塞UI
+        threading.Thread(target=_preview, daemon=True).start()
 
 
 class ConfigManager:
@@ -393,7 +499,10 @@ class ConfigManager:
             'volume': 0.7,
             'auto_start': False,
             'audio_device': None,
-            'keyword': '释怀'
+            'keywords': DEFAULT_KEYWORDS.copy(),
+            'music_files': PRESET_CLASSIC['files'].copy(),
+            'current_preset': 'classic',  # 'classic', 'gacha', 'custom'
+            'model_path': None  # 用户指定的模型路径
         }
         try:
             if CONFIG_FILE.exists():
@@ -406,8 +515,11 @@ class ConfigManager:
         
     def save_config(self):
         try:
+            # 确保所有字符串都是正确的UTF-8
             with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
                 json.dump(self.config, f, ensure_ascii=False, indent=2)
+            print(f"[配置] 已保存到: {CONFIG_FILE}")
+            print(f"[配置] hotkey: {self.config.get('hotkey')}")
         except Exception as e:
             print(f"配置保存失败: {e}")
             
@@ -432,8 +544,8 @@ class MainWindow(QMainWindow):
         self.signals = SignalEmitter()
         
         # 音频播放器
-        audio_file = os.path.join(self.base_path, "guanyu_song.mp3")
-        self.player = AudioPlayer(audio_file)
+        music_files = self.config.get('music_files', PRESET_CLASSIC['files'].copy())
+        self.player = AudioPlayer(music_files, self.base_path)
         self.player.set_volume(self.config.get('volume', 0.7))
         
         # 热键监听器
@@ -444,9 +556,10 @@ class MainWindow(QMainWindow):
         
         # 语音识别器
         self.voice_recognizer = VoiceRecognizer(
-            self.config.get('keyword', '释怀'),
+            self.config.get('keywords', DEFAULT_KEYWORDS.copy()),
             self.on_keyword_detected,
-            self.config.get('audio_device')
+            self.config.get('audio_device'),
+            self.config.get('model_path')
         )
         
         # 快捷键捕获器
@@ -454,7 +567,7 @@ class MainWindow(QMainWindow):
         
         # 信号连接
         self.signals.trigger_play.connect(self.toggle_play)
-        self.signals.keyword_detected.connect(self.toggle_play)
+        self.signals.keyword_detected.connect(self.on_keyword_detected_ui)
         self.signals.hotkey_captured.connect(self.on_hotkey_capture_finished)
         
         # 初始化UI
@@ -473,7 +586,7 @@ class MainWindow(QMainWindow):
         
     def init_ui(self):
         """初始化用户界面"""
-        self.setWindowTitle("关羽之歌便携版")
+        self.setWindowTitle("关羽之歌便携版 - by 依然匹萨吧")
         
         # 设置图标
         icon_path = os.path.join(self.base_path, "guanyu_icon.ico")
@@ -483,9 +596,15 @@ class MainWindow(QMainWindow):
         # DPI适配
         self.setup_dpi_scaling()
         
-        # 主窗口部件
+        # 创建滚动区域
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.NoFrame)
+        self.setCentralWidget(scroll_area)
+        
+        # 主窗口部件（放在滚动区域内）
         central_widget = QWidget()
-        self.setCentralWidget(central_widget)
+        scroll_area.setWidget(central_widget)
         layout = QVBoxLayout(central_widget)
         layout.setSpacing(15)
         layout.setContentsMargins(20, 20, 20, 20)
@@ -495,12 +614,14 @@ class MainWindow(QMainWindow):
         trigger_layout = QVBoxLayout(trigger_group)
         
         trigger_label = QLabel()
-        keyword = self.config.get('keyword', '释怀')
+        keywords = self.config.get('keywords', DEFAULT_KEYWORDS.copy())
+        keywords_display = '【' + '】【'.join(keywords) + '】'
         trigger_label.setText(
             f'<p style="line-height: 1.6;">'
             f'按下 <b style="color: #2196F3;">快捷键</b> 或语音中检测到关键词 '
-            f'<b style="color: #E91E63;">【{keyword}】</b> 时触发播放<br>'
+            f'<b style="color: #E91E63;">{keywords_display}</b> 时触发播放<br>'
             f'<span style="color: #666; font-size: 9pt;">(再次触发可停止播放)</span>'
+            f'<span style="color: #999; font-size: 9pt;">本软件免费，禁止商用贩卖，音乐版权归音乐作者所有</span>'
             f'</p>'
         )
         trigger_label.setTextFormat(Qt.RichText)
@@ -509,6 +630,38 @@ class MainWindow(QMainWindow):
         self.trigger_label = trigger_label  # 保存引用以便更新
         
         layout.addWidget(trigger_group)
+        
+        # === 状态显示区域 ===
+        status_group = QGroupBox("状态信息")
+        status_layout = QVBoxLayout(status_group)
+        
+        # 正在播放
+        playing_layout = QHBoxLayout()
+        playing_layout.addWidget(QLabel("正在播放:"))
+        self.playing_label = QLabel("无")
+        self.playing_label.setStyleSheet("""
+            color: #4CAF50; 
+            font-weight: bold;
+            font-size: 10pt;
+        """)
+        playing_layout.addWidget(self.playing_label)
+        playing_layout.addStretch()
+        status_layout.addLayout(playing_layout)
+        
+        # 最近检测
+        detect_layout = QHBoxLayout()
+        detect_layout.addWidget(QLabel("检测到关键词:"))
+        self.detect_label = QLabel("无")
+        self.detect_label.setStyleSheet("""
+            color: #E91E63; 
+            font-weight: bold;
+            font-size: 10pt;
+        """)
+        detect_layout.addWidget(self.detect_label)
+        detect_layout.addStretch()
+        status_layout.addLayout(detect_layout)
+        
+        layout.addWidget(status_group)
         
         # === 播放控制组 ===
         play_group = QGroupBox("播放控制")
@@ -551,7 +704,91 @@ class MainWindow(QMainWindow):
         
         layout.addWidget(play_group)
         
-        # === 设备选择组 ===
+        # === 关键词和音乐设置（横向排布） ===
+        settings_row1 = QHBoxLayout()
+        settings_row1.setSpacing(10)
+        
+        # === 关键词设置组 ===
+        keyword_group = QGroupBox("关键词设置 (最多10个)")
+        keyword_layout = QVBoxLayout(keyword_group)
+        
+        keywords = self.config.get('keywords', DEFAULT_KEYWORDS.copy())
+        
+        # 显示当前关键词
+        self.keywords_display_label = QLabel('、'.join(keywords))
+        self.keywords_display_label.setStyleSheet("""
+            font-weight: bold; 
+            color: #E91E63; 
+            font-size: 10pt;
+            padding: 5px 8px;
+            background-color: #FCE4EC;
+            border-radius: 4px;
+        """)
+        self.keywords_display_label.setWordWrap(True)
+        keyword_layout.addWidget(self.keywords_display_label)
+        
+        # 按钮
+        keyword_btn_layout = QHBoxLayout()
+        self.edit_keywords_btn = QPushButton("编辑")
+        self.reset_keywords_btn = QPushButton("默认")
+        keyword_btn_layout.addWidget(self.edit_keywords_btn)
+        keyword_btn_layout.addWidget(self.reset_keywords_btn)
+        keyword_layout.addLayout(keyword_btn_layout)
+        
+        self.edit_keywords_btn.clicked.connect(self.open_keyword_editor)
+        self.reset_keywords_btn.clicked.connect(self.reset_keywords)
+        
+        settings_row1.addWidget(keyword_group)
+        
+        # === 音乐设置组 ===
+        music_group = QGroupBox("音乐设置 (最多10首)")
+        music_layout = QVBoxLayout(music_group)
+        
+        # 显示当前模式
+        current_preset = self.config.get('current_preset', 'classic')
+        music_files = self.config.get('music_files', PRESET_CLASSIC['files'].copy())
+        
+        preset_name = {
+            'classic': '经典模式',
+            'gacha': '抽卡模式',
+            'custom': '自定义模式'
+        }.get(current_preset, '自定义模式')
+        
+        mode_count_layout = QHBoxLayout()
+        self.preset_label = QLabel(preset_name)
+        self.preset_label.setStyleSheet("""
+            font-weight: bold; 
+            color: #FF9800; 
+            font-size: 10pt;
+            padding: 5px 8px;
+            background-color: #FFF3E0;
+            border-radius: 4px;
+        """)
+        mode_count_layout.addWidget(self.preset_label)
+        self.music_count_label = QLabel(f"{len(music_files)}首")
+        self.music_count_label.setStyleSheet("color: #666; font-size: 10pt;")
+        mode_count_layout.addWidget(self.music_count_label)
+        mode_count_layout.addStretch()
+        music_layout.addLayout(mode_count_layout)
+        
+        # 按钮组
+        music_btn_layout = QHBoxLayout()
+        self.manage_music_btn = QPushButton("管理")
+        self.preset_classic_btn = QPushButton("经典模式")
+        self.preset_gacha_btn = QPushButton("抽卡模式")
+        music_btn_layout.addWidget(self.manage_music_btn)
+        music_btn_layout.addWidget(self.preset_classic_btn)
+        music_btn_layout.addWidget(self.preset_gacha_btn)
+        music_layout.addLayout(music_btn_layout)
+        
+        self.manage_music_btn.clicked.connect(self.open_music_manager)
+        self.preset_classic_btn.clicked.connect(lambda: self.apply_preset('classic'))
+        self.preset_gacha_btn.clicked.connect(lambda: self.apply_preset('gacha'))
+        
+        settings_row1.addWidget(music_group)
+        
+        layout.addLayout(settings_row1)
+        
         device_group = QGroupBox("音频输入设备 (用于语音识别)")
         device_layout = QVBoxLayout(device_group)
         
@@ -560,12 +797,37 @@ class MainWindow(QMainWindow):
         self.device_combo.currentIndexChanged.connect(self.on_device_changed)
         device_layout.addWidget(self.device_combo)
         
+        # 模型路径设置
+        model_path_layout = QHBoxLayout()
+        model_path_label = QLabel("语音模型:\n(可换不同语言的模型)")
+        self.model_path_display = QLabel()
+        self.update_model_path_display()
+        self.model_path_display.setStyleSheet("""
+            color: #666; 
+            font-size: 9pt;
+            padding: 2px;
+        """)
+        self.model_path_display.setWordWrap(True)
+        browse_model_btn = QPushButton("选择模型文件夹")
+        browse_model_btn.clicked.connect(self.browse_model_folder)
+        clear_model_btn = QPushButton("恢复默认")
+        clear_model_btn.clicked.connect(self.clear_model_path)
+        model_path_layout.addWidget(model_path_label)
+        model_path_layout.addWidget(self.model_path_display, 1)
+        model_path_layout.addWidget(browse_model_btn)
+        model_path_layout.addWidget(clear_model_btn)
+        device_layout.addLayout(model_path_layout)
+        
         # 语音识别状态
         self.voice_status_label = QLabel()
         self.update_voice_status()
         device_layout.addWidget(self.voice_status_label)
         
         layout.addWidget(device_group)
+        
+        # === 快捷键和其他设置（横向排布） ===
+        settings_row2 = QHBoxLayout()
+        settings_row2.setSpacing(10)
         
         # === 快捷键设置组 ===
         hotkey_group = QGroupBox("快捷键设置")
@@ -574,31 +836,29 @@ class MainWindow(QMainWindow):
         current_hotkey = self.config.get('hotkey', DEFAULT_HOTKEY.copy())
         hotkey_str = self.format_hotkey(current_hotkey)
         
-        hotkey_display_layout = QHBoxLayout()
-        hotkey_display_layout.addWidget(QLabel("当前快捷键:"))
         self.hotkey_label = QLabel(hotkey_str)
         self.hotkey_label.setStyleSheet("""
             font-weight: bold; 
             color: #2196F3; 
-            font-size: 12pt;
+            font-size: 11pt;
             padding: 5px 10px;
             background-color: #E3F2FD;
             border-radius: 4px;
         """)
-        hotkey_display_layout.addWidget(self.hotkey_label)
-        hotkey_display_layout.addStretch()
-        hotkey_layout.addLayout(hotkey_display_layout)
+        self.hotkey_label.setAlignment(Qt.AlignCenter)
+        hotkey_layout.addWidget(self.hotkey_label)
         
         hotkey_btn_layout = QHBoxLayout()
-        self.set_hotkey_btn = QPushButton("修改快捷键")
-        self.set_hotkey_btn.clicked.connect(self.start_hotkey_capture)
-        self.reset_hotkey_btn = QPushButton("恢复默认")
-        self.reset_hotkey_btn.clicked.connect(self.reset_hotkey)
+        self.set_hotkey_btn = QPushButton("修改")
+        self.reset_hotkey_btn = QPushButton("默认")
         hotkey_btn_layout.addWidget(self.set_hotkey_btn)
         hotkey_btn_layout.addWidget(self.reset_hotkey_btn)
         hotkey_layout.addLayout(hotkey_btn_layout)
         
-        layout.addWidget(hotkey_group)
+        self.set_hotkey_btn.clicked.connect(self.start_hotkey_capture)
+        self.reset_hotkey_btn.clicked.connect(self.reset_hotkey)
+        
+        settings_row2.addWidget(hotkey_group)
         
         # === 其他设置组 ===
         settings_group = QGroupBox("其他设置")
@@ -609,34 +869,32 @@ class MainWindow(QMainWindow):
         self.autostart_checkbox.stateChanged.connect(self.on_autostart_changed)
         settings_layout.addWidget(self.autostart_checkbox)
         
-        layout.addWidget(settings_group)
+        # 打开配置文件位置按钮
+        open_config_btn = QPushButton("打开配置文件位置")
+        open_config_btn.clicked.connect(self.open_config_location)
+        settings_layout.addWidget(open_config_btn)
         
-        # === 作者信息 ===
-        author_frame = QFrame()
-        author_frame.setStyleSheet("""
-            QFrame {
-                background-color: #f5f5f5;
-                border-radius: 8px;
-                padding: 10px;
-            }
-        """)
-        author_layout = QHBoxLayout(author_frame)
-        author_layout.setContentsMargins(10, 8, 10, 8)
+        settings_row2.addWidget(settings_group)
+        
+        layout.addLayout(settings_row2)
+        
+        # === 作者信息（紧凑版） ===
+        author_layout = QHBoxLayout()
         author_layout.addStretch()
         author_label = QLabel(
-            '作者@<a href="https://space.bilibili.com/6297797" '
-            'style="color: #2196F3; text-decoration: none; font-weight: bold;">'
-            '依然匹萨吧</a>'
+            '<span style="color: #999; font-size: 9pt;">作者: </span>'
+            '<a href="https://space.bilibili.com/6297797" '
+            'style="color: #2196F3; text-decoration: none;">依然匹萨吧</a>'
         )
         author_label.setOpenExternalLinks(True)
         author_label.setTextFormat(Qt.RichText)
         author_layout.addWidget(author_label)
         author_layout.addStretch()
-        layout.addWidget(author_frame)
+        layout.addLayout(author_layout)
         
-        # 设置窗口大小
-        self.setMinimumSize(420, 520)
-        self.resize(450, 560)
+        # 设置窗口大小（调整为合理大小，内容可滚动）
+        self.setMinimumSize(520, 600)
+        self.resize(520, 710)
         
     def format_hotkey(self, hotkey_list):
         """格式化热键显示"""
@@ -644,7 +902,21 @@ class MainWindow(QMainWindow):
         def key_priority(k):
             return (KEY_PRIORITY.get(k.lower(), 10), k)
         sorted_keys = sorted(hotkey_list, key=key_priority)
-        return ' + '.join([k.upper() for k in sorted_keys])
+        # 确保单字符键正确显示
+        display_keys = []
+        for k in sorted_keys:
+            # 确保k是字符串类型
+            key_str = str(k) if k else ''
+            print(f"[调试] 处理按键: {repr(k)}, 类型: {type(k)}, 长度: {len(key_str)}")
+            # 单字符直接大写显示
+            if len(key_str) == 1:
+                display_keys.append(key_str.upper())
+            else:
+                # 修饰键首字母大写
+                display_keys.append(key_str.capitalize())
+        result = ' + '.join(display_keys)
+        print(f"[调试] 格式化结果: {repr(result)}")
+        return result
         
     def update_voice_status(self):
         """更新语音识别状态显示"""
@@ -658,7 +930,7 @@ class MainWindow(QMainWindow):
             )
         else:
             self.voice_status_label.setText(
-                '<span style="color: #FF9800;">⚠ 语音模型未找到，请下载模型</span>'
+                '<span style="color: #FF9800;">⚠ 语音模型未找到，请尝试手动指定模型路径</span>'
             )
         self.voice_status_label.setTextFormat(Qt.RichText)
         
@@ -666,7 +938,7 @@ class MainWindow(QMainWindow):
         """设置DPI缩放"""
         screen = QApplication.primaryScreen()
         dpi = screen.logicalDotsPerInch()
-        scale_factor = dpi / 96.0
+        scale_factor = dpi / 150.0
         
         base_font_size = max(9, int(10 * scale_factor))
         font = QFont()
@@ -735,13 +1007,45 @@ class MainWindow(QMainWindow):
             if index >= 0:
                 self.device_combo.setCurrentIndex(index)
                 
+    def on_keyword_detected_ui(self, keyword):
+        """关键词检测UI更新（主线程）"""
+        from datetime import datetime
+        time_str = datetime.now().strftime("%H:%M:%S")
+        status_text = f"{keyword} ({time_str})"
+        self.detect_label.setText(status_text)
+        print(f"[UI已更新] 检测到关键词: {status_text}")
+        # 触发播放
+        self.toggle_play()
+    
     def on_hotkey_triggered(self):
         """热键触发回调（从子线程调用）"""
+        # 先更新UI再触发播放
+        try:
+            from datetime import datetime
+            time_str = datetime.now().strftime("%H:%M:%S")
+            status_text = f"快捷键触发 ({time_str})"
+            # 确保在主线程中更新UI - 使用默认参数捕获变量
+            QTimer.singleShot(0, lambda text=status_text: self.detect_label.setText(text))
+            print(f"[UI更新] {status_text}")
+        except Exception as e:
+            print(f"更新检测标签失败: {e}")
+        # 然后触发播放
         self.signals.trigger_play.emit()
         
-    def on_keyword_detected(self):
+    def on_keyword_detected(self, keyword):
         """关键词检测回调（从子线程调用）"""
-        self.signals.keyword_detected.emit()
+        # 先更新UI再触发播放
+        try:
+            from datetime import datetime
+            time_str = datetime.now().strftime("%H:%M:%S")
+            status_text = f"{keyword} ({time_str})"
+            print(f"[关键词检测] {keyword} at {time_str}")
+            # 通过信号在主线程中更新UI
+            self.signals.keyword_detected.emit(keyword)
+        except Exception as e:
+            print(f"关键词检测处理失败: {e}")
+            # 即使出错也尝试触发播放
+            self.signals.keyword_detected.emit(keyword if keyword else "未知")
         
     def toggle_play(self):
         """切换播放状态"""
@@ -763,6 +1067,10 @@ class MainWindow(QMainWindow):
                     background-color: #b71c1c;
                 }
             """)
+            # 更新正在播放的显示
+            current_file = self.player.get_current_file()
+            if current_file:
+                self.playing_label.setText(current_file)
         else:
             self.play_btn.setText("▶ 播放")
             self.play_btn.setStyleSheet("""
@@ -780,6 +1088,8 @@ class MainWindow(QMainWindow):
                     background-color: #3d8b40;
                 }
             """)
+            # 停止播放时清空显示
+            self.playing_label.setText("无")
             
     def on_volume_changed(self, value):
         """音量变化处理"""
@@ -819,7 +1129,7 @@ class MainWindow(QMainWindow):
         """快捷键捕获完成（主线程）"""
         self.set_hotkey_btn.setEnabled(True)
         self.reset_hotkey_btn.setEnabled(True)
-        self.set_hotkey_btn.setText("修改快捷键")
+        self.set_hotkey_btn.setText("修改")
         
         if result and len(result) >= 2:
             # 保存新热键
@@ -860,6 +1170,330 @@ class MainWindow(QMainWindow):
             f"快捷键已恢复为默认值: {hotkey_str}"
         )
         
+    def open_keyword_editor(self):
+        """打开关键词编辑对话框"""
+        from PyQt5.QtWidgets import QDialog, QTextEdit
+        
+        dialog = QDialog(self)
+        dialog.setWindowTitle("编辑关键词")
+        dialog.setMinimumWidth(350)
+        
+        layout = QVBoxLayout(dialog)
+        
+        # 说明文本
+        label = QLabel("每行输入一个关键词，最多10个。保持为空行则不添加：")
+        label.setStyleSheet("color: #666; font-size: 10pt; margin-bottom: 10px;")
+        layout.addWidget(label)
+        
+        # 文本编辑框
+        text_edit = QTextEdit()
+        current_keywords = self.config.get('keywords', DEFAULT_KEYWORDS.copy())
+        text_edit.setPlainText('\n'.join(current_keywords))
+        text_edit.setMinimumHeight(200)
+        layout.addWidget(text_edit)
+        
+        # 按钮
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+        
+        ok_btn = QPushButton("保存")
+        cancel_btn = QPushButton("取消")
+        
+        def on_ok():
+            keywords_text = text_edit.toPlainText()
+            # 处理关键词
+            keywords = [k.strip() for k in keywords_text.split('\n') if k.strip()]
+            
+            # 验证
+            if len(keywords) == 0:
+                QMessageBox.warning(dialog, "提示", "至少需要设置一个关键词")
+                return
+            if len(keywords) > 10:
+                QMessageBox.warning(dialog, "提示", "最多只能设置10个关键词")
+                return
+            
+            # 检查是否有重复
+            if len(keywords) != len(set(keywords)):
+                QMessageBox.warning(dialog, "提示", "关键词不能重复")
+                return
+            
+            # 保存配置
+            self.config.set('keywords', keywords)
+            self.voice_recognizer.keywords = keywords
+            
+            # 更新UI显示
+            self.keywords_display_label.setText('、'.join(keywords))
+            self.update_trigger_label()
+            
+            QMessageBox.information(dialog, "成功", f"关键词已更新: {', '.join(keywords)}")
+            dialog.accept()
+        
+        ok_btn.clicked.connect(on_ok)
+        cancel_btn.clicked.connect(dialog.reject)
+        
+        button_layout.addWidget(ok_btn)
+        button_layout.addWidget(cancel_btn)
+        layout.addLayout(button_layout)
+        
+        dialog.exec_()
+    
+    def reset_keywords(self):
+        """重置关键词为默认值"""
+        default_keywords = DEFAULT_KEYWORDS.copy()
+        self.config.set('keywords', default_keywords)
+        self.voice_recognizer.keywords = default_keywords
+        
+        # 更新UI显示
+        self.keywords_display_label.setText('、'.join(default_keywords))
+        self.update_trigger_label()
+        
+        QMessageBox.information(
+            self, "提示", 
+            f"关键词已恢复为默认值: {', '.join(default_keywords)}"
+        )
+    
+    def update_trigger_label(self):
+        """更新触发说明标签"""
+        keywords = self.config.get('keywords', DEFAULT_KEYWORDS.copy())
+        keywords_display = '【' + '】【'.join(keywords) + '】'
+        self.trigger_label.setText(
+            f'<p style="line-height: 1.6;">'
+            f'按下 <b style="color: #2196F3;">快捷键</b> 或语音中检测到关键词 '
+            f'<b style="color: #E91E63;">{keywords_display}</b> 时触发播放<br>'
+            f'<span style="color: #666; font-size: 9pt;">(再次触发可停止播放)</span>'
+            f'</p>'
+        )
+    
+    def open_music_manager(self):
+        """打开音乐管理对话框"""
+        from PyQt5.QtWidgets import QDialog, QListWidget, QFileDialog
+        
+        dialog = QDialog(self)
+        dialog.setWindowTitle("音乐管理")
+        dialog.setMinimumSize(500, 400)
+        
+        layout = QVBoxLayout(dialog)
+        
+        # 说明文本
+        label = QLabel("最多添加10个音乐文件，支持mp3/wav/ogg格式。触发时将随机播放一首：")
+        label.setStyleSheet("color: #666; font-size: 10pt; margin-bottom: 10px;")
+        layout.addWidget(label)
+        
+        # 音乐列表
+        from PyQt5.QtWidgets import QListWidgetItem
+        music_list = QListWidget()
+        current_files = self.config.get('music_files', PRESET_CLASSIC['files'].copy())
+        for file in current_files:
+            # 判断是绝对路径还是相对路径
+            if os.path.isabs(file):
+                filename = os.path.basename(file)
+                item = QListWidgetItem(filename)
+                item.setData(Qt.UserRole, file)  # 保存完整路径
+                item.setToolTip(file)  # 鼠标悬停显示完整路径
+                music_list.addItem(item)
+            else:
+                # 相对路径（预设模式）
+                item = QListWidgetItem(file)
+                item.setData(Qt.UserRole, file)
+                music_list.addItem(item)
+        music_list.setSelectionMode(QListWidget.SingleSelection)
+        layout.addWidget(music_list)
+        
+        # 按钮组
+        button_layout = QHBoxLayout()
+        
+        add_btn = QPushButton("添加文件")
+        remove_btn = QPushButton("删除选中")
+        preview_btn = QPushButton("试听")
+        stop_preview_btn = QPushButton("停止试听")
+        
+        def on_add():
+            if music_list.count() >= 10:
+                QMessageBox.warning(dialog, "提示", "最多只能添加10个音乐文件")
+                return
+            
+            files, _ = QFileDialog.getOpenFileNames(
+                dialog,
+                "选择音乐文件",
+                "",
+                "音频文件 (*.mp3 *.wav *.ogg);;所有文件 (*.*)"
+            )
+            
+            if files:
+                for file_path in files:
+                    if music_list.count() >= 10:
+                        QMessageBox.warning(dialog, "提示", "已达到10个文件上限")
+                        break
+                    
+                    # 检查文件是否存在
+                    if not os.path.exists(file_path):
+                        QMessageBox.warning(dialog, "错误", f"文件不存在: {file_path}")
+                        continue
+                    
+                    # 检查是否已在列表中
+                    exists = False
+                    for i in range(music_list.count()):
+                        # 使用data存储完整路径，text显示文件名
+                        item = music_list.item(i)
+                        if item.data(Qt.UserRole) == file_path:
+                            exists = True
+                            break
+                    
+                    if exists:
+                        QMessageBox.information(dialog, "提示", f"文件已在列表中")
+                        continue
+                    
+                    # 直接添加文件路径，不复制
+                    try:
+                        from PyQt5.QtWidgets import QListWidgetItem
+                        filename = os.path.basename(file_path)
+                        item = QListWidgetItem(filename)
+                        item.setData(Qt.UserRole, file_path)  # 保存完整路径
+                        item.setToolTip(file_path)  # 鼠标悬停显示完整路径
+                        music_list.addItem(item)
+                    except Exception as e:
+                        QMessageBox.warning(dialog, "错误", f"添加文件失败: {e}")
+        
+        def on_remove():
+            current_item = music_list.currentItem()
+            if not current_item:
+                QMessageBox.warning(dialog, "提示", "请先选择要删除的文件")
+                return
+            
+            filename = current_item.text()
+            reply = QMessageBox.question(
+                dialog, "确认", 
+                f"确定要从列表中删除 {filename} 吗？\n(文件不会从磁盘删除)",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Yes:
+                music_list.takeItem(music_list.row(current_item))
+        
+        def on_preview():
+            current_item = music_list.currentItem()
+            if not current_item:
+                QMessageBox.warning(dialog, "提示", "请先选择要试听的文件")
+                return
+            
+            # 获取保存的完整路径
+            file_path = current_item.data(Qt.UserRole)
+            if not file_path:
+                # 兼容旧格式（相对路径）
+                file_path = os.path.join(self.base_path, current_item.text())
+            
+            if not os.path.exists(file_path):
+                QMessageBox.warning(dialog, "错误", f"文件不存在: {file_path}")
+                return
+            
+            # 异步预览，避免阻塞UI
+            try:
+                self.player.preview(file_path)
+                print(f"[试听] 开始播放: {os.path.basename(file_path)}")
+            except Exception as e:
+                print(f"[试听错误] {e}")
+                QMessageBox.warning(dialog, "错误", f"试听失败: {e}")
+        
+        def on_stop_preview():
+            # 异步停止，避免阻塞UI
+            threading.Thread(target=self.player.stop, daemon=True).start()
+        
+        add_btn.clicked.connect(on_add)
+        remove_btn.clicked.connect(on_remove)
+        preview_btn.clicked.connect(on_preview)
+        stop_preview_btn.clicked.connect(on_stop_preview)
+        
+        button_layout.addWidget(add_btn)
+        button_layout.addWidget(remove_btn)
+        button_layout.addWidget(preview_btn)
+        button_layout.addWidget(stop_preview_btn)
+        layout.addLayout(button_layout)
+        
+        # 确定/取消按钮
+        dialog_btn_layout = QHBoxLayout()
+        dialog_btn_layout.addStretch()
+        
+        ok_btn = QPushButton("保存")
+        cancel_btn = QPushButton("取消")
+        
+        def on_ok():
+            # 收集音乐文件列表（保存完整路径）
+            files = []
+            for i in range(music_list.count()):
+                item = music_list.item(i)
+                # 获取保存的完整路径
+                file_path = item.data(Qt.UserRole)
+                if file_path:
+                    files.append(file_path)
+                else:
+                    # 兼容旧格式
+                    files.append(item.text())
+            
+            if len(files) == 0:
+                QMessageBox.warning(dialog, "提示", "至少需要一个音乐文件")
+                return
+            
+            # 保存配置
+            self.config.set('music_files', files)
+            self.config.set('current_preset', 'custom')
+            
+            # 更新播放器
+            self.player.update_files(files)
+            
+            # 更新UI显示
+            self.preset_label.setText('自定义模式')
+            self.music_count_label.setText(f"{len(files)}首")
+            
+            QMessageBox.information(dialog, "成功", f"音乐列表已更新，共 {len(files)} 首")
+            dialog.accept()
+        
+        ok_btn.clicked.connect(on_ok)
+        cancel_btn.clicked.connect(dialog.reject)
+        
+        dialog_btn_layout.addWidget(ok_btn)
+        dialog_btn_layout.addWidget(cancel_btn)
+        layout.addLayout(dialog_btn_layout)
+        
+        dialog.exec_()
+    
+    def apply_preset(self, preset_type):
+        """应用预设模式"""
+        if preset_type == 'classic':
+            preset = PRESET_CLASSIC
+        elif preset_type == 'gacha':
+            preset = PRESET_GACHA
+        else:
+            return
+        
+        # 检查文件是否存在
+        missing_files = []
+        for filename in preset['files']:
+            file_path = os.path.join(self.base_path, filename)
+            if not os.path.exists(file_path):
+                missing_files.append(filename)
+        
+        if missing_files:
+            msg = f"以下文件不存在，无法应用{preset['name']}：\n" + "\n".join(missing_files)
+            msg += "\n\n请确保这些文件在程序目录下。"
+            QMessageBox.warning(self, "文件缺失", msg)
+            return
+        
+        # 应用预设
+        self.config.set('music_files', preset['files'].copy())
+        self.config.set('current_preset', preset_type)
+        
+        # 更新播放器
+        self.player.update_files(preset['files'])
+        
+        # 更新UI
+        self.preset_label.setText(preset['name'])
+        self.music_count_label.setText(f"{len(preset['files'])}首")
+        
+        QMessageBox.information(
+            self, "成功", 
+            f"已应用{preset['name']}，共 {len(preset['files'])} 首音乐"
+        )
+        
     def on_autostart_changed(self, state):
         """开机启动设置变化"""
         enabled = state == Qt.Checked
@@ -870,6 +1504,109 @@ class MainWindow(QMainWindow):
             self.autostart_checkbox.setChecked(not enabled)
             self.autostart_checkbox.blockSignals(False)
         
+    def update_model_path_display(self):
+        """更新模型路径显示"""
+        model_path = self.config.get('model_path')
+        if model_path:
+            # 截断显示过长的路径
+            if len(model_path) > 50:
+                display_path = "..." + model_path[-47:]
+            else:
+                display_path = model_path
+            self.model_path_display.setText(display_path)
+            self.model_path_display.setToolTip(model_path)
+        else:
+            self.model_path_display.setText(f"默认: {DEFAULT_MODEL_PATH}")
+            self.model_path_display.setToolTip(f"使用默认模型路径: {DEFAULT_MODEL_PATH}")
+    
+    def browse_model_folder(self):
+        """浏览并选择模型文件夹"""
+        from PyQt5.QtWidgets import QFileDialog
+        
+        current_path = self.config.get('model_path')
+        if not current_path or not os.path.exists(current_path):
+            current_path = str(Path.home())
+        
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "选择Vosk模型文件夹",
+            current_path,
+            QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks
+        )
+        
+        if folder:
+            # 验证是否是有效的模型文件夹
+            required_files = ['am', 'conf', 'graph']
+            is_valid = all(os.path.exists(os.path.join(folder, f)) for f in required_files)
+            
+            if not is_valid:
+                reply = QMessageBox.question(
+                    self,
+                    "确认",
+                    f"所选文件夹可能不是有效的Vosk模型文件夹。\n\n"
+                    f"有效的模型文件夹应包含: am, conf, graph 等子文件夹。\n\n"
+                    f"是否仍要使用此路径？",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                if reply != QMessageBox.Yes:
+                    return
+            
+            # 保存路径
+            self.config.set('model_path', folder)
+            self.voice_recognizer.set_model_path(folder)
+            self.update_model_path_display()
+            
+            # 如果语音识别正在运行，延迟更新状态以确保模型加载完成
+            QTimer.singleShot(2000, self.update_voice_status)
+            
+            # 根据验证结果给出提示
+            if is_valid:
+                QMessageBox.information(
+                    self, "成功",
+                    f"已设置模型路径为:\n{folder}\n\n模型已加载，语音识别功能可用。"
+                )
+            else:
+                QMessageBox.information(
+                    self, "成功",
+                    f"已设置模型路径为:\n{folder}\n\n请确保这是有效的Vosk模型文件夹。"
+                )
+    
+    def clear_model_path(self):
+        """清除模型路径，恢复默认路径"""
+        self.config.set('model_path', None)
+        self.voice_recognizer.set_model_path(None)
+        self.update_model_path_display()
+        
+        # 延迟更新状态，确保模型加载完成
+        QTimer.singleShot(2000, self.update_voice_status)
+        
+        QMessageBox.information(
+            self, "提示",
+            f"已恢复默认模型路径。\n程序将使用: {DEFAULT_MODEL_PATH}"
+        )
+    
+    def open_config_location(self):
+        """打开配置文件所在位置"""
+        try:
+            import subprocess
+            config_path = str(CONFIG_FILE.absolute())
+            
+            if sys.platform == 'win32':
+                # Windows: 使用 explorer 并选中文件
+                subprocess.run(['explorer', '/select,', config_path])
+            elif sys.platform == 'darwin':
+                # macOS: 使用 Finder 并选中文件
+                subprocess.run(['open', '-R', config_path])
+            else:
+                # Linux: 打开文件所在目录
+                config_dir = str(CONFIG_FILE.parent)
+                subprocess.run(['xdg-open', config_dir])
+                
+            print(f"已打开配置文件位置: {config_path}")
+        except Exception as e:
+            print(f"打开配置文件位置失败: {e}")
+            QMessageBox.warning(self, "错误", f"无法打开配置文件位置: {e}")
+    
     def set_autostart(self, enabled):
         """设置开机启动"""
         if sys.platform == 'win32':

@@ -393,6 +393,68 @@ class AudioPlayer:
         except Exception as e:
             print(f"音频初始化失败: {e}")
             self.initialized = False
+
+    def set_output_device(self, device_index):
+        """尝试切换输出设备（best-effort）：重新初始化 pygame.mixer"""
+        self.output_device_index = device_index
+        acquired = self.lock.acquire(timeout=2.0)
+        if not acquired:
+            print("[警告] 无法获取音频锁，切换输出设备被跳过")
+            return
+
+        try:
+            try:
+                mixer.music.stop()
+            except Exception:
+                pass
+            try:
+                mixer.quit()
+            except Exception:
+                pass
+
+            # best-effort: some pygame versions accept devicename
+            if device_index is None:
+                try:
+                    mixer.init()
+                    self.initialized = True
+                except Exception as e:
+                    print(f"恢复默认输出设备失败: {e}")
+                    self.initialized = False
+            else:
+                try:
+                    dev_info = sd.query_devices(device_index)
+                    dev_name = dev_info.get('name')
+                except Exception:
+                    dev_name = None
+
+                if dev_name:
+                    try:
+                        mixer.init(devicename=dev_name)
+                        self.initialized = True
+                    except TypeError:
+                        try:
+                            mixer.init()
+                            self.initialized = True
+                        except Exception as e:
+                            print(f"初始化输出设备失败: {e}")
+                            self.initialized = False
+                    except Exception as e:
+                        print(f"使用设备名初始化失败: {e}")
+                        try:
+                            mixer.init()
+                            self.initialized = True
+                        except Exception as e2:
+                            print(f"退回默认初始化仍失败: {e2}")
+                            self.initialized = False
+                else:
+                    try:
+                        mixer.init()
+                        self.initialized = True
+                    except Exception as e:
+                        print(f"初始化输出设备失败: {e}")
+                        self.initialized = False
+        finally:
+            self.lock.release()
         
     def play(self, specific_file=None):
         """播放音频，如果不指定文件则随机选择一个"""
@@ -499,6 +561,7 @@ class ConfigManager:
             'volume': 0.7,
             'auto_start': False,
             'audio_device': None,
+            'audio_output_device': None,  # 输出设备索引或None
             'keywords': DEFAULT_KEYWORDS.copy(),
             'music_files': PRESET_CLASSIC['files'].copy(),
             'current_preset': 'classic',  # 'classic', 'gacha', 'custom'
@@ -789,13 +852,29 @@ class MainWindow(QMainWindow):
         
         layout.addLayout(settings_row1)
         
-        device_group = QGroupBox("音频输入设备 (用于语音识别)")
+        device_group = QGroupBox("音频输入/输出设备 (用于语音识别与播放)")
         device_layout = QVBoxLayout(device_group)
-        
+
+        # 输入与输出设备并列显示
+        h = QHBoxLayout()
+        input_label = QLabel("输入设备:")
         self.device_combo = QComboBox()
-        self.populate_audio_devices()
+        self.device_combo.setMinimumWidth(220)
         self.device_combo.currentIndexChanged.connect(self.on_device_changed)
-        device_layout.addWidget(self.device_combo)
+        h.addWidget(input_label)
+        h.addWidget(self.device_combo)
+
+        output_label = QLabel("输出设备:")
+        self.output_device_combo = QComboBox()
+        self.output_device_combo.setMinimumWidth(220)
+        self.output_device_combo.currentIndexChanged.connect(self.on_output_device_changed)
+        h.addWidget(output_label)
+        h.addWidget(self.output_device_combo)
+
+        device_layout.addLayout(h)
+
+        # 枚举并填充设备（函数会同时填充输入与输出下拉）
+        self.populate_audio_devices()
         
         # 模型路径设置
         model_path_layout = QHBoxLayout()
@@ -989,23 +1068,45 @@ class MainWindow(QMainWindow):
         
     def populate_audio_devices(self):
         """填充音频设备列表"""
-        self.device_combo.clear()
-        self.device_combo.addItem("默认设备", None)
-        
+        # 清空并添加默认项
+        try:
+            self.device_combo.clear()
+            self.device_combo.addItem("默认设备", None)
+        except Exception:
+            pass
+
+        try:
+            self.output_device_combo.clear()
+            self.output_device_combo.addItem("默认设备", None)
+        except Exception:
+            pass
+
         try:
             devices = sd.query_devices()
             for i, device in enumerate(devices):
-                if device['max_input_channels'] > 0:
-                    self.device_combo.addItem(f"{device['name']}", i)
+                name = device.get('name', f"device-{i}")
+                # 输入设备
+                if device.get('max_input_channels', 0) > 0:
+                    self.device_combo.addItem(f"{name}", i)
+                # 输出设备
+                if device.get('max_output_channels', 0) > 0:
+                    self.output_device_combo.addItem(f"{name}", i)
         except Exception as e:
             print(f"获取音频设备失败: {e}")
-            
-        # 设置当前选中的设备
+
+        # 恢复保存的输入设备选择
         saved_device = self.config.get('audio_device')
         if saved_device is not None:
             index = self.device_combo.findData(saved_device)
             if index >= 0:
                 self.device_combo.setCurrentIndex(index)
+
+        # 恢复保存的输出设备选择
+        saved_out = self.config.get('audio_output_device')
+        if saved_out is not None:
+            index_out = self.output_device_combo.findData(saved_out)
+            if index_out >= 0:
+                self.output_device_combo.setCurrentIndex(index_out)
                 
     def on_keyword_detected_ui(self, keyword):
         """关键词检测UI更新（主线程）"""
@@ -1105,6 +1206,16 @@ class MainWindow(QMainWindow):
         self.voice_recognizer.set_device(device_index)
         # 延迟更新状态
         QTimer.singleShot(1000, self.update_voice_status)
+
+    def on_output_device_changed(self, index):
+        """输出设备变化处理"""
+        device_index = self.output_device_combo.currentData()
+        self.config.set('audio_output_device', device_index)
+        # 尝试通知播放器切换输出（best-effort）
+        try:
+            self.player.set_output_device(device_index)
+        except Exception as e:
+            print(f"切换输出设备时发生错误: {e}")
         
     def start_hotkey_capture(self):
         """开始捕获新快捷键"""

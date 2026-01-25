@@ -1,12 +1,12 @@
 @echo off
-echo æ­£åœ¨å®‰è£…ä¾èµ–...
+echo ÕıÔÚ°²×°ÒÀÀµ...
 python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-pip install pyinstaller
+call .venv\Scripts\activate
+pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+pip install pyinstaller -i https://pypi.tuna.tsinghua.edu.cn/simple
 
-echo æ­£åœ¨æ‰“åŒ…...
+echo ÕıÔÚ´ò°ü...
 pyinstaller --clean build.spec
 
-echo æ‰“åŒ…å®Œæˆï¼
+echo ´ò°üÍê³É£¡
 pause
